@@ -16,7 +16,7 @@ jobs:
         with:
           kernel-url: https://github.com/ajugeorge98/kernel_msm-4.9.git
           kernel-dir: testing
-          kernel-branch: ttesting
+          kernel-branch: testing
           config: msm8937-perf_defconfig
           arch: arm
           aosp-gcc: true
