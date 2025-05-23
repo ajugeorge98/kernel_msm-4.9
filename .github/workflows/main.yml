@@ -1,29 +1,59 @@
-name: Build Kernel
+name: Build Kernel MSM8937 (zImage only)
+
 on:
-  workflow_dispatch:
+  push:
+    branches:
+      - testing
 
 jobs:
-  Build-Kernel:
-    strategy:
-      fail-fast: false
+  build-kernel:
+    name: Build zImage for Cat S22 Flip (MSM8937)
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
+
+    env:
+      ARCH: arm
+      SUBARCH: arm
+      DEFCONFIG: msm8937_defconfig
+      CLANG_TRIPLE: arm-linux-gnueabi-
+      CROSS_COMPILE: arm-linux-gnueabi-
 
     steps:
-      - name: Build Kernel
-        uses: dabao1955/kernel_build_action@main
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y bc bison flex libssl-dev make libc6-dev \
+            libncurses5-dev libelf-dev ccache build-essential \
+            clang lld llvm gcc-arm-linux-gnueabi
+
+      - name: Setup output directory
+        run: mkdir -p out
+
+      - name: Configure Kernel
+        run: |
+          make O=out $DEFCONFIG
+
+      - name: Build Kernel (zImage only)
+        run: |
+          make -j$(nproc) O=out \
+            ARCH=$ARCH \
+            CC=clang \
+            CROSS_COMPILE=$CROSS_COMPILE \
+            CLANG_TRIPLE=$CLANG_TRIPLE \
+            LD=ld.lld zImage
+
+      - name: Rename zImage
+        run: |
+          mkdir -p release
+          cp out/arch/arm/boot/zImage release/zImage
+
+      - name: Upload zImage to Release
+        uses: softprops/action-gh-release@v1
         with:
-          kernel-url: https://github.com/ajugeorge98/kernel_msm-4.9.git
-          kernel-dir: testing
-          kernel-branch: testing
-          config: msm8937-perf_defconfig
-          arch: arm
-          aosp-gcc: true
-          aosp-clang: true
-          ksu: false
-          ksu-version: main
-          android-version: 12
-          aosp-clang-version: r383902
-          disable-lto: true
-          anykernel3: true
+          tag_name: ${{ github.sha }}
+          name: Kernel zImage Build - ${{ github.sha }}
+          files: release/zImage
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
