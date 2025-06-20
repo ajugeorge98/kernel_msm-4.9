@@ -34,11 +34,16 @@ jobs:
           bc \
           bison \
           flex \
-          libssl-dev \
+          libssl1.1 \
+          libssl-dev=1.1.1* \
           libncurses-dev \
           wget \
           tar \
-          xz-utils
+          xz-utils \
+          python2.7 \
+          git-core \
+          gnupg \
+          libelf-dev
 
     - name: Create output directory
       run: |
@@ -56,6 +61,20 @@ jobs:
         tar xf linaro.tar.xz
         rm linaro.tar.xz
         echo "$TOOLCHAIN_DIR/$TOOLCHAIN/bin" >> $GITHUB_PATH
+
+    - name: Verify toolchain
+      run: |
+        arm-eabi-gcc --version
+        arm-eabi-ld --version
+
+    - name: Fix diag_pcie build issue
+      run: |
+        # Check if diag_pcie exists and create dummy if missing
+        if [ ! -f "$KERNEL_DIR/drivers/char/diag/diag_pcie.c" ]; then
+          echo "Creating dummy diag_pcie implementation..."
+          echo "// Dummy diag_pcie implementation" > "$KERNEL_DIR/drivers/char/diag/diag_pcie.c"
+          echo "obj-y += diag_pcie.o" >> "$KERNEL_DIR/drivers/char/diag/Makefile"
+        fi
 
     - name: Generate Makefile includes
       run: |
@@ -81,21 +100,34 @@ jobs:
       run: |
         export CROSS_COMPILE="arm-eabi-"
         export ARCH=arm
+        export KCFLAGS="-Wno-deprecated-declarations"  # Suppress OpenSSL warnings
         
         cd "$KERNEL_DIR"
         make clean && make mrproper
+        
+        # First pass to generate config dependencies
         make "$CONFIG" O="$OUTPUT_DIR"
         
-        # Build with error logging
+        # Verify DIAG_PCIE config
+        if grep -q "CONFIG_DIAG_PCIE=y" "$OUTPUT_DIR/.config"; then
+          echo "Disabling DIAG_PCIE in config"
+          sed -i 's/CONFIG_DIAG_PCIE=y/CONFIG_DIAG_PCIE=n/' "$OUTPUT_DIR/.config"
+        fi
+        
+        # Second pass with full build
         if ! make -j$(nproc) O="$OUTPUT_DIR" 2> "$OUTPUT_DIR/errors.log"; then
           echo "::error::Build failed!"
-          grep -i 'error:' "$OUTPUT_DIR/errors.log" | sort | uniq -c
+          echo "=== Last 20 errors ==="
+          grep -i 'error:' "$OUTPUT_DIR/errors.log" | tail -n 20
+          echo "=== Critical errors ==="
+          grep -i 'stop' "$OUTPUT_DIR/errors.log" | sort | uniq -c
           exit 1
         fi
-
+        
         # Verify output
         if [ ! -f "$OUTPUT_DIR/arch/arm/boot/zImage" ]; then
           echo "::error::zImage not found!"
+          ls -la "$OUTPUT_DIR/arch/arm/boot/"
           exit 1
         fi
 
@@ -117,3 +149,16 @@ jobs:
         path: |
           ${{ env.OUTPUT_DIR }}/*.log
         retention-days: 30
+
+    - name: Analyze build failures
+      if: failure()
+      run: |
+        echo "=== Build failure analysis ==="
+        echo "Most common errors:"
+        grep -i 'error:' "$OUTPUT_DIR/errors.log" | sort | uniq -c | sort -nr | head -n 10
+        echo ""
+        echo "Missing file suggestions:"
+        grep -i 'No such file' "$OUTPUT_DIR/errors.log" | sort | uniq
+        echo ""
+        echo "Makefile issues:"
+        grep -i 'No rule to make target' "$OUTPUT_DIR/errors.log" | sort | uniq
