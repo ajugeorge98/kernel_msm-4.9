@@ -1,59 +1,119 @@
-name: Build Kernel MSM8937 (zImage only)
+name: Kernel Builder
 
 on:
   push:
-    branches:
-      - testing
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  KERNEL_DIR: ${{ github.workspace }}
+  OUTPUT_BASE: ${{ github.workspace }}/builds
+  TOOLCHAIN_DIR: ${{ github.workspace }}/toolchain
+  CONFIG: msm8937go_defconfig
+  TOOLCHAIN_URL: https://releases.linaro.org/components/toolchain/binaries/7.5-2019.12/arm-eabi/gcc-linaro-7.5.0-2019.12-x86_64_arm-eabi.tar.xz
+  TOOLCHAIN: gcc-linaro-7.5.0-2019.12-x86_64_arm-eabi
 
 jobs:
-  build-kernel:
-    name: Build zImage for Cat S22 Flip (MSM8937)
+  build:
     runs-on: ubuntu-latest
-
-    env:
-      ARCH: arm
-      SUBARCH: arm
-      DEFCONFIG: msm8937_defconfig
-      CLANG_TRIPLE: arm-linux-gnueabi-
-      CROSS_COMPILE: arm-linux-gnueabi-
+    timeout-minutes: 60
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+    - name: Checkout repository
+      uses: actions/checkout@v3
+      with:
+        submodules: recursive
 
-      - name: Install dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y bc bison flex libssl-dev make libc6-dev \
-            libncurses5-dev libelf-dev ccache build-essential \
-            clang lld llvm gcc-arm-linux-gnueabi
+    - name: Set up build environment
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential \
+          bc \
+          bison \
+          flex \
+          libssl-dev \
+          libncurses-dev \
+          wget \
+          tar \
+          xz-utils
 
-      - name: Setup output directory
-        run: mkdir -p out
+    - name: Create output directory
+      run: |
+        BUILD_DATE=$(date +%Y%m%d_%H%M%S)
+        OUTPUT_DIR="$OUTPUT_BASE/build_$BUILD_DATE"
+        echo "OUTPUT_DIR=$OUTPUT_DIR" >> $GITHUB_ENV
+        mkdir -p "$OUTPUT_DIR"
+        echo "Build artifacts will be saved to: $OUTPUT_DIR"
 
-      - name: Configure Kernel
-        run: |
-          make O=out $DEFCONFIG
+    - name: Install toolchain
+      run: |
+        mkdir -p "$TOOLCHAIN_DIR"
+        cd "$TOOLCHAIN_DIR"
+        wget -q "$TOOLCHAIN_URL" -O linaro.tar.xz
+        tar xf linaro.tar.xz
+        rm linaro.tar.xz
+        echo "$TOOLCHAIN_DIR/$TOOLCHAIN/bin" >> $GITHUB_PATH
 
-      - name: Build Kernel (zImage only)
-        run: |
-          make -j$(nproc) O=out \
-            ARCH=$ARCH \
-            CC=clang \
-            CROSS_COMPILE=$CROSS_COMPILE \
-            CLANG_TRIPLE=$CLANG_TRIPLE \
-            LD=ld.lld zImage
+    - name: Generate Makefile includes
+      run: |
+        # Find all relevant directories and create include paths
+        find "$KERNEL_DIR/drivers" "$KERNEL_DIR/arch/arm" "$KERNEL_DIR/include" \
+          -type d -print | while read -r dir; do
+          makefile="$dir/Makefile"
+          if [ -f "$makefile" ]; then
+            rel_path="${dir#$KERNEL_DIR/}"
+            if ! grep -q "ccflags-y.*-I\$(srctree)/$rel_path" "$makefile"; then
+              echo "ccflags-y += -I\$(srctree)/$rel_path" >> "$makefile"
+              echo "Added include path to $makefile"
+            fi
+          fi
+        done
 
-      - name: Rename zImage
-        run: |
-          mkdir -p release
-          cp out/arch/arm/boot/zImage release/zImage
+        # Apply special cases
+        echo "ccflags-y += -I\$(srctree)/drivers/usb/gadget -I\$(srctree)/drivers/usb/gadget/function" \
+          >> "$KERNEL_DIR/drivers/usb/gadget/Makefile"
+        echo "ccflags-y += -I\$(src)" >> "$KERNEL_DIR/drivers/soc/qcom/Makefile"
 
-      - name: Upload zImage to Release
-        uses: softprops/action-gh-release@v1
-        with:
-          tag_name: ${{ github.sha }}
-          name: Kernel zImage Build - ${{ github.sha }}
-          files: release/zImage
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    - name: Build kernel
+      run: |
+        export CROSS_COMPILE="arm-eabi-"
+        export ARCH=arm
+        
+        cd "$KERNEL_DIR"
+        make clean && make mrproper
+        make "$CONFIG" O="$OUTPUT_DIR"
+        
+        # Build with error logging
+        if ! make -j$(nproc) O="$OUTPUT_DIR" 2> "$OUTPUT_DIR/errors.log"; then
+          echo "::error::Build failed!"
+          grep -i 'error:' "$OUTPUT_DIR/errors.log" | sort | uniq -c
+          exit 1
+        fi
+
+        # Verify output
+        if [ ! -f "$OUTPUT_DIR/arch/arm/boot/zImage" ]; then
+          echo "::error::zImage not found!"
+          exit 1
+        fi
+
+    - name: Archive build artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: kernel-build-${{ env.BUILD_DATE }}
+        path: |
+          ${{ env.OUTPUT_DIR }}/arch/arm/boot/zImage
+          ${{ env.OUTPUT_DIR }}/.config
+          ${{ env.OUTPUT_DIR }}/*.log
+        retention-days: 7
+
+    - name: Upload build logs
+      if: always()
+      uses: actions/upload-artifact@v3
+      with:
+        name: build-logs-${{ env.BUILD_DATE }}
+        path: |
+          ${{ env.OUTPUT_DIR }}/*.log
+        retention-days: 30
